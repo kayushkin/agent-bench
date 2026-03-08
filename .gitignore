@@ -2,4 +2,5 @@ work/
 results/
 .inber/
 .openclaw/
+logs/
 testdata/sample-server/.git/
