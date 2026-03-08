@@ -47,8 +47,32 @@ func SaveResult(dir string, r *Result) error {
 	if err != nil {
 		return err
 	}
-	path := filepath.Join(dir, r.Agent+".json")
+	filename := r.Agent + ".json"
+	if r.Trial > 0 {
+		filename = fmt.Sprintf("%s-trial%d.json", r.Agent, r.Trial)
+	}
+	path := filepath.Join(dir, filename)
 	return os.WriteFile(path, data, 0644)
+}
+
+func fmtTokens(n float64) string {
+	if n >= 1_000_000 {
+		return fmt.Sprintf("%.1fM", n/1_000_000)
+	}
+	if n >= 1_000 {
+		return fmt.Sprintf("%.1fK", n/1_000)
+	}
+	return fmt.Sprintf("%.0f", n)
+}
+
+func fmtCost(c float64) string {
+	if c < 0.001 {
+		return fmt.Sprintf("$%.5f", c)
+	}
+	if c < 0.01 {
+		return fmt.Sprintf("$%.4f", c)
+	}
+	return fmt.Sprintf("$%.3f", c)
 }
 
 // PrintComparison outputs a side-by-side comparison.
@@ -58,78 +82,98 @@ func (r *Report) PrintComparison() {
 		return
 	}
 
-	// Sort by total tokens (ascending = more efficient first)
-	sort.Slice(r.Results, func(i, j int) bool {
-		return r.Results[i].Metrics.TotalTokens < r.Results[j].Metrics.TotalTokens
+	task := r.Results[0].Task
+	summaries := Summarize(r.Results)
+
+	// Sort by avg total tokens ascending
+	sort.Slice(summaries, func(i, j int) bool {
+		return summaries[i].AvgTotal < summaries[j].AvgTotal
 	})
 
-	task := r.Results[0].Task
+	hasMultipleTrials := summaries[0].Trials > 1
+	trialLabel := ""
+	if hasMultipleTrials {
+		trialLabel = fmt.Sprintf(" (%d trials avg)", summaries[0].Trials)
+	}
 
-	fmt.Printf("\n═══ Agent Benchmark: %s ═══\n\n", task)
-	fmt.Printf("%-12s %8s %8s %8s %8s %6s %6s %6s %5s %5s\n",
-		"Agent", "Input", "Output", "Total", "Cache", "Turns", "Tools", "Time", "Build", "Test")
-	fmt.Println(strings.Repeat("─", 90))
+	fmt.Printf("\n═══ Agent Benchmark: %s%s ═══\n\n", task, trialLabel)
 
-	for _, res := range r.Results {
-		m := res.Metrics
-		q := res.Quality
-		buildStr := "✓"
-		if !q.Builds {
-			buildStr = "✗"
-		}
-		testStr := "✓"
-		if !q.TestsPass {
-			testStr = "✗"
-		}
+	// Token & cost table
+	fmt.Printf("%-12s %-10s %8s %8s %8s %8s %8s %6s %5s  %s\n",
+		"Agent", "Model", "Input", "Output", "Total", "Cache", "Cost", "Tools", "Time", "Pass")
+	fmt.Println(strings.Repeat("─", 100))
 
+	for _, s := range summaries {
 		cacheStr := "-"
-		if m.CacheReadTokens > 0 {
-			cacheStr = fmt.Sprintf("%d", m.CacheReadTokens)
+		if s.AvgCache > 0 {
+			cacheStr = fmtTokens(s.AvgCache)
 		}
 
-		modelStr := ""
-		if m.Model != "" {
-			modelStr = fmt.Sprintf(" (%s)", m.Model)
+		modelStr := s.Model
+		if len(modelStr) > 10 {
+			// Shorten model name
+			modelStr = strings.ReplaceAll(modelStr, "claude-", "")
+			modelStr = strings.ReplaceAll(modelStr, "-20250514", "")
+			modelStr = strings.ReplaceAll(modelStr, "-20250", "")
 		}
 
-		fmt.Printf("%-12s %8d %8d %8d %8s %6d %6d %5.0fs %5s %5s%s\n",
-			res.Agent,
-			m.InputTokens,
-			m.OutputTokens,
-			m.TotalTokens,
-			cacheStr,
-			m.Turns,
-			m.ToolCalls,
-			m.WallTimeSec,
-			buildStr,
-			testStr,
+		passStr := fmt.Sprintf("%d/%d", s.Successes, s.Trials)
+
+		fmt.Printf("%-12s %-10s %8s %8s %8s %8s %8s %6.0f %4.0fs  %s\n",
+			s.Agent,
 			modelStr,
+			fmtTokens(s.AvgInput),
+			fmtTokens(s.AvgOutput),
+			fmtTokens(s.AvgTotal),
+			cacheStr,
+			fmtCost(s.AvgCost),
+			s.AvgTools,
+			s.AvgTime,
+			passStr,
 		)
 	}
 
 	fmt.Println()
 
 	// Git diff comparison
-	fmt.Printf("%-14s %8s %8s %8s %s\n", "Agent", "Files", "Added", "Removed", "Scope Creep")
-	fmt.Println(strings.Repeat("─", 60))
-	for _, res := range r.Results {
-		g := res.Git
-		fmt.Printf("%-14s %8d %8d %8d %d files\n",
-			res.Agent,
-			g.FilesChanged,
-			g.LinesAdded,
-			g.LinesRemoved,
-			res.Quality.ScopeCreep,
+	fmt.Printf("%-12s %8s %8s %8s\n", "Agent", "Files", "Added", "Removed")
+	fmt.Println(strings.Repeat("─", 45))
+	for _, s := range summaries {
+		fmt.Printf("%-12s %8.0f %8.0f %8.0f\n",
+			s.Agent,
+			s.AvgFiles,
+			s.AvgAdded,
+			s.AvgRemoved,
 		)
 	}
 
 	// Winner summary
 	fmt.Println()
-	if len(r.Results) > 1 {
-		best := r.Results[0]
-		worst := r.Results[len(r.Results)-1]
-		savings := float64(worst.Metrics.TotalTokens-best.Metrics.TotalTokens) / float64(worst.Metrics.TotalTokens) * 100
-		fmt.Printf("🏆 Most efficient: %s (%d tokens, %.0f%% fewer than %s)\n",
-			best.Agent, best.Metrics.TotalTokens, savings, worst.Agent)
+	if len(summaries) > 1 {
+		best := summaries[0]
+		worst := summaries[len(summaries)-1]
+
+		if worst.AvgTotal > 0 {
+			savings := (worst.AvgTotal - best.AvgTotal) / worst.AvgTotal * 100
+			fmt.Printf("🏆 Most efficient: %s (%.0f avg tokens, %.0f%% fewer than %s)\n",
+				best.Agent, best.AvgTotal, savings, worst.Agent)
+		}
+
+		// Find cheapest (lowest cost) separately from most efficient
+		cheapest := summaries[0]
+		expensive := summaries[len(summaries)-1]
+		for _, s := range summaries {
+			if s.AvgCost > 0 && (cheapest.AvgCost == 0 || s.AvgCost < cheapest.AvgCost) {
+				cheapest = s
+			}
+			if s.AvgCost > expensive.AvgCost {
+				expensive = s
+			}
+		}
+		if cheapest.AvgCost > 0 && expensive.AvgCost > cheapest.AvgCost {
+			costSavings := (expensive.AvgCost - cheapest.AvgCost) / expensive.AvgCost * 100
+			fmt.Printf("💰 Cheapest: %s (%s avg vs %s for %s, %.0f%% savings)\n",
+				cheapest.Agent, fmtCost(cheapest.AvgCost), fmtCost(expensive.AvgCost), expensive.Agent, costSavings)
+		}
 	}
 }

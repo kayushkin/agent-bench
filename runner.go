@@ -23,6 +23,8 @@ type Runner struct {
 	BuildCmd string // build command (e.g. "go build ./...")
 	TestCmd  string // test command (e.g. "go test ./...")
 	MaxTurns int    // max agent turns (default 15)
+	Model    string // model to use (e.g. "claude-sonnet-4-20250514")
+	Trial    int    // trial number (for multi-trial runs)
 }
 
 // Run executes the benchmark and returns the result.
@@ -30,6 +32,7 @@ func (r *Runner) Run() (*Result, error) {
 	result := &Result{
 		Agent:     r.Agent,
 		Task:      filepath.Base(r.Task),
+		Trial:     r.Trial,
 		Timestamp: time.Now(),
 	}
 
@@ -79,6 +82,14 @@ func (r *Runner) Run() (*Result, error) {
 	// Run quality checks
 	result.Quality = r.checkQuality(repoDir)
 
+	// Set model if known from runner config but not from output
+	if result.Metrics.Model == "" && r.Model != "" {
+		result.Metrics.Model = r.Model
+	}
+
+	// Calculate cost
+	result.Metrics.CalculateCost()
+
 	return result, nil
 }
 
@@ -112,27 +123,26 @@ func (r *Runner) runInber(repoDir, prompt string) (string, error) {
 		maxTurns = 15
 	}
 
-	// inber run: synchronous, outputs to stdout/stderr
-	// --new: fresh session, --max-turns: limit turns
-	cmd := exec.Command("inber", "run",
-		"--new",
-		"--max-turns", strconv.Itoa(maxTurns),
-		prompt,
-	)
+	args := []string{"run", "--new", "--max-turns", strconv.Itoa(maxTurns)}
+	if r.Model != "" {
+		args = append(args, "--model", r.Model)
+	}
+	args = append(args, prompt)
+
+	cmd := exec.Command("inber", args...)
 	cmd.Dir = repoDir
 
-	// Capture both stdout and stderr
 	out, err := cmd.CombinedOutput()
 	return string(out), err
 }
 
 func (r *Runner) runOpenClaw(repoDir, prompt string) (string, error) {
-	// Use openclaw agent --local with a dedicated bench agent
-	// to avoid session lock conflicts with running agents
-	sessionID := fmt.Sprintf("bench-%d", time.Now().UnixMilli())
-
-	// Resolve absolute path for the repo dir
 	absRepoDir, _ := filepath.Abs(repoDir)
+
+	// Ensure agent-bench has auth
+	r.pinOpenClawModel(r.Model)
+
+	sessionID := fmt.Sprintf("bench-%d", time.Now().UnixMilli())
 
 	// Prefix prompt with working directory context
 	fullPrompt := fmt.Sprintf("You are working in the directory: %s\n\nIMPORTANT: Use this exact path for all file operations. Do not read AGENTS.md, SOUL.md, USER.md, or any workspace files. Focus only on the task.\n\n%s", absRepoDir, prompt)
@@ -154,15 +164,29 @@ func (r *Runner) runOpenClaw(repoDir, prompt string) (string, error) {
 	cmd.Stderr = &stderr
 	err := cmd.Run()
 
-	combined := stdout.String() + "\n" + stderr.String()
-
 	// Save raw output for debugging
 	debugDir := filepath.Join(r.WorkDir, "debug")
 	os.MkdirAll(debugDir, 0755)
 	os.WriteFile(filepath.Join(debugDir, "openclaw-stdout.txt"), []byte(stdout.String()), 0644)
 	os.WriteFile(filepath.Join(debugDir, "openclaw-stderr.txt"), []byte(stderr.String()), 0644)
 
-	return combined, err
+	// Return stdout only — JSON output is on stdout, stderr has diagnostic noise
+	// that causes json.Unmarshal to fail with "extra data"
+	return stdout.String(), err
+}
+
+// pinOpenClawModel copies main agent's auth to agent-bench.
+// Model pinning not yet implemented — openclaw uses gateway defaults.
+func (r *Runner) pinOpenClawModel(model string) {
+	home := os.Getenv("HOME")
+	ocDir := filepath.Join(home, ".openclaw")
+
+	// Copy main agent's auth-profiles to agent-bench
+	mainAuth := filepath.Join(ocDir, "agents", "main", "agent", "auth-profiles.json")
+	benchAuth := filepath.Join(ocDir, "agents", "agent-bench", "agent", "auth-profiles.json")
+	if data, err := os.ReadFile(mainAuth); err == nil {
+		os.WriteFile(benchAuth, data, 0644)
+	}
 }
 
 func (r *Runner) parseMetrics(output string, m *Metrics) {

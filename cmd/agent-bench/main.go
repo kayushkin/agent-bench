@@ -29,6 +29,8 @@ func main() {
 		testCmd  string
 		outDir   string
 		maxTurns int
+		model    string
+		trials   int
 	)
 
 	runCmd := &cobra.Command{
@@ -46,60 +48,82 @@ func main() {
 			if outDir == "" {
 				outDir = filepath.Join("results", timestamp)
 			}
-			workDir := filepath.Join("work", timestamp)
-			os.MkdirAll(workDir, 0755)
 
 			agentsToRun := []string{agent}
 			if all {
 				agentsToRun = defaultAgents
 			}
+			if trials < 1 {
+				trials = 1
+			}
 
-			for _, a := range agentsToRun {
-				fmt.Printf("\n═══ Running: %s ═══\n\n", a)
+			for trial := 1; trial <= trials; trial++ {
+				for _, a := range agentsToRun {
+					trialLabel := ""
+					if trials > 1 {
+						trialLabel = fmt.Sprintf(" (trial %d/%d)", trial, trials)
+					}
+					fmt.Printf("\n═══ %s%s ═══\n\n", a, trialLabel)
 
-				r := &bench.Runner{
-					WorkDir:  workDir,
-					Agent:    a,
-					Task:     task,
-					RepoURL:  repo,
-					RepoDir:  repoDir,
-					Commit:   commit,
-					BuildCmd: buildCmd,
-					TestCmd:  testCmd,
-					MaxTurns: maxTurns,
-				}
+					workDir := filepath.Join("work", timestamp, fmt.Sprintf("trial%d", trial))
+					os.MkdirAll(workDir, 0755)
 
-				result, err := r.Run()
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "error running %s: %v\n", a, err)
-					continue
-				}
+					r := &bench.Runner{
+						WorkDir:  workDir,
+						Agent:    a,
+						Task:     task,
+						RepoURL:  repo,
+						RepoDir:  repoDir,
+						Commit:   commit,
+						BuildCmd: buildCmd,
+						TestCmd:  testCmd,
+						MaxTurns: maxTurns,
+						Model:    model,
+						Trial:    trial,
+					}
 
-				if err := bench.SaveResult(outDir, result); err != nil {
-					fmt.Fprintf(os.Stderr, "error saving result: %v\n", err)
-				}
+					result, err := r.Run()
+					if err != nil {
+						fmt.Fprintf(os.Stderr, "error running %s: %v\n", a, err)
+						continue
+					}
 
-				m := result.Metrics
-				q := result.Quality
-				fmt.Printf("  tokens: in=%d out=%d total=%d\n", m.InputTokens, m.OutputTokens, m.TotalTokens)
-				if m.CostUSD > 0 {
-					fmt.Printf("  cost:   $%.4f\n", m.CostUSD)
+					if err := bench.SaveResult(outDir, result); err != nil {
+						fmt.Fprintf(os.Stderr, "error saving result: %v\n", err)
+					}
+
+					m := result.Metrics
+					q := result.Quality
+					fmt.Printf("  model:  %s\n", m.Model)
+					fmt.Printf("  tokens: in=%d out=%d total=%d", m.InputTokens, m.OutputTokens, m.TotalTokens)
+					if m.CacheReadTokens > 0 {
+						fmt.Printf(" cache=%d", m.CacheReadTokens)
+					}
+					fmt.Println()
+					fmt.Printf("  cost:   %s\n", fmtCostCLI(m.CostUSD))
+					fmt.Printf("  tools:  %d  time: %.1fs\n", m.ToolCalls, m.WallTimeSec)
+					fmt.Printf("  git:    %d files, +%d -%d\n", result.Git.FilesChanged, result.Git.LinesAdded, result.Git.LinesRemoved)
+					fmt.Printf("  build:  %v  tests: %v\n", q.Builds, q.TestsPass)
+					if result.Error != "" {
+						fmt.Printf("  error:  %s\n", result.Error)
+					}
+					fmt.Println()
 				}
-				fmt.Printf("  turns:  %d  tools: %d\n", m.Turns, m.ToolCalls)
-				fmt.Printf("  time:   %.1fs\n", m.WallTimeSec)
-				fmt.Printf("  git:    %d files, +%d -%d\n", result.Git.FilesChanged, result.Git.LinesAdded, result.Git.LinesRemoved)
-				fmt.Printf("  build:  %v  tests: %v\n", q.Builds, q.TestsPass)
-				if result.Error != "" {
-					fmt.Printf("  error:  %s\n", result.Error)
+			}
+
+			// Print summary if multiple trials
+			if trials > 1 {
+				report, err := bench.LoadResults(outDir)
+				if err == nil {
+					report.PrintComparison()
 				}
-				fmt.Println()
 			}
 
 			return nil
 		},
 	}
 
-	runCmd.Flags().StringVarP(&agent, "agent", "a", "inber", "Agent to benchmark (inber, openclaw)")
+	runCmd.Flags().StringVarP(&agent, "agent", "a", "inber", "Agent to benchmark")
 	runCmd.Flags().BoolVar(&all, "all", false, "Run all agents")
 	runCmd.Flags().StringVarP(&task, "task", "t", "", "Path to task markdown file")
 	runCmd.Flags().StringVarP(&repo, "repo", "r", "", "Git repo URL to clone")
@@ -109,6 +133,8 @@ func main() {
 	runCmd.Flags().StringVar(&testCmd, "test-cmd", "", "Test command (default: go test ./...)")
 	runCmd.Flags().StringVarP(&outDir, "out", "o", "", "Output directory for results")
 	runCmd.Flags().IntVar(&maxTurns, "max-turns", 15, "Max agent turns")
+	runCmd.Flags().StringVarP(&model, "model", "m", "claude-sonnet-4-20250514", "Model for both agents")
+	runCmd.Flags().IntVarP(&trials, "trials", "n", 1, "Number of trials per agent")
 
 	compareCmd := &cobra.Command{
 		Use:   "compare [results-dir]",
@@ -126,4 +152,14 @@ func main() {
 
 	root.AddCommand(runCmd, compareCmd)
 	root.Execute()
+}
+
+func fmtCostCLI(c float64) string {
+	if c == 0 {
+		return "$0"
+	}
+	if c < 0.001 {
+		return fmt.Sprintf("$%.5f", c)
+	}
+	return fmt.Sprintf("$%.4f", c)
 }
