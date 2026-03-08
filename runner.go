@@ -123,7 +123,9 @@ func (r *Runner) runInber(repoDir, prompt string) (string, error) {
 		maxTurns = 15
 	}
 
-	args := []string{"run", "--new", "--max-turns", strconv.Itoa(maxTurns)}
+	args := []string{"run", "--new", "--no-hooks",
+		"--system", "You are a coding assistant. Complete the task efficiently. Call tools directly without narration. Do not explain what you are about to do — just do it. Skip summaries unless asked.",
+		"--max-turns", strconv.Itoa(maxTurns)}
 	if r.Model != "" {
 		args = append(args, "--model", r.Model)
 	}
