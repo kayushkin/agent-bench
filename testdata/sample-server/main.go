@@ -43,12 +43,32 @@ func handleItems(w http.ResponseWriter, r *http.Request) {
 		mu.RLock()
 		defer mu.RUnlock()
 
-		// BUG: limit and offset are parsed but never applied
-		_ = r.URL.Query().Get("limit")
-		_ = r.URL.Query().Get("offset")
+		result := items
+
+		// Apply pagination
+		limitStr := r.URL.Query().Get("limit")
+		offsetStr := r.URL.Query().Get("offset")
+
+		if offsetStr != "" {
+			offset, err := strconv.Atoi(offsetStr)
+			if err == nil && offset > 0 {
+				if offset >= len(result) {
+					result = nil
+				} else {
+					result = result[offset:]
+				}
+			}
+		}
+
+		if limitStr != "" {
+			limit, err := strconv.Atoi(limitStr)
+			if err == nil && limit > 0 && limit < len(result) {
+				result = result[:limit]
+			}
+		}
 
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(items)
+		json.NewEncoder(w).Encode(result)
 
 	case http.MethodPost:
 		var item Item
