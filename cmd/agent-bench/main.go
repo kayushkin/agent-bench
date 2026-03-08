@@ -57,6 +57,18 @@ func main() {
 				trials = 1
 			}
 
+			// Auto-detect per-task testdata: testdata/{task-name}/ takes priority over --dir
+			effectiveRepoDir := repoDir
+			if effectiveRepoDir != "" {
+				taskBase := filepath.Base(task)
+				taskName := taskBase[:len(taskBase)-len(filepath.Ext(taskBase))]
+				perTaskDir := filepath.Join("testdata", taskName)
+				if info, err := os.Stat(perTaskDir); err == nil && info.IsDir() {
+					fmt.Printf("Using per-task testdata: %s\n", perTaskDir)
+					effectiveRepoDir = perTaskDir
+				}
+			}
+
 			for trial := 1; trial <= trials; trial++ {
 				for _, a := range agentsToRun {
 					trialLabel := ""
@@ -73,7 +85,7 @@ func main() {
 						Agent:    a,
 						Task:     task,
 						RepoURL:  repo,
-						RepoDir:  repoDir,
+						RepoDir:  effectiveRepoDir,
 						Commit:   commit,
 						BuildCmd: buildCmd,
 						TestCmd:  testCmd,
@@ -97,11 +109,14 @@ func main() {
 					fmt.Printf("  model:  %s\n", m.Model)
 					fmt.Printf("  tokens: in=%d out=%d total=%d", m.InputTokens, m.OutputTokens, m.TotalTokens)
 					if m.CacheReadTokens > 0 {
-						fmt.Printf(" cache=%d", m.CacheReadTokens)
+						fmt.Printf(" cache_read=%d", m.CacheReadTokens)
+					}
+					if m.CacheCreationTokens > 0 {
+						fmt.Printf(" cache_write=%d", m.CacheCreationTokens)
 					}
 					fmt.Println()
 					fmt.Printf("  cost:   %s\n", fmtCostCLI(m.CostUSD))
-					fmt.Printf("  tools:  %d  time: %.1fs\n", m.ToolCalls, m.WallTimeSec)
+					fmt.Printf("  turns:  %d  tools: %d  time: %.1fs\n", m.Turns, m.ToolCalls, m.WallTimeSec)
 					fmt.Printf("  git:    %d files, +%d -%d\n", result.Git.FilesChanged, result.Git.LinesAdded, result.Git.LinesRemoved)
 					fmt.Printf("  build:  %v  tests: %v\n", q.Builds, q.TestsPass)
 					if result.Error != "" {
@@ -133,7 +148,7 @@ func main() {
 	runCmd.Flags().StringVar(&testCmd, "test-cmd", "", "Test command (default: go test ./...)")
 	runCmd.Flags().StringVarP(&outDir, "out", "o", "", "Output directory for results")
 	runCmd.Flags().IntVar(&maxTurns, "max-turns", 15, "Max agent turns")
-	runCmd.Flags().StringVarP(&model, "model", "m", "claude-sonnet-4-20250514", "Model for both agents")
+	runCmd.Flags().StringVarP(&model, "model", "m", "claude-sonnet-4-5-20250929", "Model for both agents")
 	runCmd.Flags().IntVarP(&trials, "trials", "n", 1, "Number of trials per agent")
 
 	compareCmd := &cobra.Command{

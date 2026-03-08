@@ -99,14 +99,18 @@ func (r *Report) PrintComparison() {
 	fmt.Printf("\n═══ Agent Benchmark: %s%s ═══\n\n", task, trialLabel)
 
 	// Token & cost table
-	fmt.Printf("%-12s %-10s %8s %8s %8s %8s %8s %6s %5s  %s\n",
-		"Agent", "Model", "Input", "Output", "Total", "Cache", "Cost", "Tools", "Time", "Pass")
-	fmt.Println(strings.Repeat("─", 100))
+	fmt.Printf("%-12s %-10s %8s %8s %8s %10s %10s %8s %5s %5s %5s  %s\n",
+		"Agent", "Model", "Input", "Output", "Total", "CacheRead", "CacheWrite", "Cost", "Turns", "Tools", "Time", "Pass")
+	fmt.Println(strings.Repeat("─", 115))
 
 	for _, s := range summaries {
-		cacheStr := "-"
-		if s.AvgCache > 0 {
-			cacheStr = fmtTokens(s.AvgCache)
+		cacheReadStr := "-"
+		if s.AvgCacheRead > 0 {
+			cacheReadStr = fmtTokens(s.AvgCacheRead)
+		}
+		cacheCreateStr := "-"
+		if s.AvgCacheCreate > 0 {
+			cacheCreateStr = fmtTokens(s.AvgCacheCreate)
 		}
 
 		modelStr := s.Model
@@ -119,14 +123,16 @@ func (r *Report) PrintComparison() {
 
 		passStr := fmt.Sprintf("%d/%d", s.Successes, s.Trials)
 
-		fmt.Printf("%-12s %-10s %8s %8s %8s %8s %8s %6.0f %4.0fs  %s\n",
+		fmt.Printf("%-12s %-10s %8s %8s %8s %10s %10s %8s %5.1f %5.0f %4.0fs  %s\n",
 			s.Agent,
 			modelStr,
 			fmtTokens(s.AvgInput),
 			fmtTokens(s.AvgOutput),
 			fmtTokens(s.AvgTotal),
-			cacheStr,
+			cacheReadStr,
+			cacheCreateStr,
 			fmtCost(s.AvgCost),
+			s.AvgTurns,
 			s.AvgTools,
 			s.AvgTime,
 			passStr,

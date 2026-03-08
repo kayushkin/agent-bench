@@ -146,7 +146,9 @@ func (r *Runner) runOpenClaw(repoDir, prompt string) (string, error) {
 	absRepoDir, _ := filepath.Abs(repoDir)
 
 	// Ensure agent-bench has auth
-	r.pinOpenClawModel(r.Model)
+	if err := r.pinOpenClawModel(r.Model); err != nil {
+		return "", fmt.Errorf("auth setup: %w", err)
+	}
 
 	sessionID := fmt.Sprintf("bench-%d", time.Now().UnixMilli())
 
@@ -182,49 +184,65 @@ func (r *Runner) runOpenClaw(repoDir, prompt string) (string, error) {
 }
 
 // pinOpenClawModel copies main agent's auth to agent-bench.
-// Model pinning not yet implemented — openclaw uses gateway defaults.
-func (r *Runner) pinOpenClawModel(model string) {
+func (r *Runner) pinOpenClawModel(model string) error {
 	home := os.Getenv("HOME")
 	ocDir := filepath.Join(home, ".openclaw")
 
-	// Copy main agent's auth-profiles to agent-bench
 	mainAuth := filepath.Join(ocDir, "agents", "main", "agent", "auth-profiles.json")
 	benchAuth := filepath.Join(ocDir, "agents", "agent-bench", "agent", "auth-profiles.json")
-	if data, err := os.ReadFile(mainAuth); err == nil {
-		os.WriteFile(benchAuth, data, 0644)
+
+	data, err := os.ReadFile(mainAuth)
+	if err != nil {
+		return fmt.Errorf("cannot read main auth-profiles.json: %w (run inber once to trigger sync)", err)
 	}
+
+	benchDir := filepath.Dir(benchAuth)
+	os.MkdirAll(benchDir, 0700)
+
+	if err := os.WriteFile(benchAuth, data, 0600); err != nil {
+		return fmt.Errorf("cannot write agent-bench auth-profiles.json: %w", err)
+	}
+	return nil
 }
 
 func (r *Runner) parseMetrics(output string, m *Metrics) {
 	lines := strings.Split(output, "\n")
-	var inberCacheRead int
+	var inberCacheRead, inberCacheCreate int
+	var inberInput, inberOutput, inberTools int
 
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
 
-		// Parse INBER_META:{json} from stderr (inber)
+		// Parse INBER_META:{json} — emitted per turn, accumulate across turns
 		if strings.HasPrefix(line, "INBER_META:") {
 			metaJSON := strings.TrimPrefix(line, "INBER_META:")
 			var meta struct {
-				InputTokens     int     `json:"input_tokens"`
-				OutputTokens    int     `json:"output_tokens"`
-				CacheReadTokens int     `json:"cache_read_tokens"`
-				Model           string  `json:"model"`
-				Cost            float64 `json:"cost"`
-				ToolCalls       int     `json:"tool_calls"`
-				Turn            int     `json:"turn"`
+				InputTokens         int     `json:"input_tokens"`
+				OutputTokens        int     `json:"output_tokens"`
+				CacheReadTokens     int     `json:"cache_read_tokens"`
+				CacheCreationTokens int     `json:"cache_creation_tokens"`
+				Model               string  `json:"model"`
+				Cost                float64 `json:"cost"`
+				ToolCalls           int     `json:"tool_calls"`
+				Turn                int     `json:"turn"`
 			}
 			if err := json.Unmarshal([]byte(metaJSON), &meta); err == nil {
-				// INBER_META is emitted per turn — accumulate
 				inberCacheRead += meta.CacheReadTokens
+				inberCacheCreate += meta.CacheCreationTokens
+				inberInput += meta.InputTokens
+				inberOutput += meta.OutputTokens
+				inberTools += meta.ToolCalls
 				if meta.Model != "" {
 					m.Model = meta.Model
+				}
+				if meta.Turn > m.Turns {
+					m.Turns = meta.Turn
 				}
 			}
 			continue
 		}
 
-		// Fallback: parse "in=X out=Y total=Z tools=N" format
+		// Fallback: parse "in=X out=Y total=Z tools=N" summary line
 		if strings.Contains(line, "in=") && strings.Contains(line, "out=") {
 			for _, part := range strings.Fields(line) {
 				if strings.HasPrefix(part, "in=") {
@@ -241,48 +259,57 @@ func (r *Runner) parseMetrics(output string, m *Metrics) {
 				}
 			}
 		}
+	}
 
-		// Count turns from "━━━ Turn N ━━━"
-		if strings.Contains(line, "Turn") && strings.Contains(line, "━━━") {
-			m.Turns++
+	// INBER_META is authoritative when present — override summary line values
+	if inberInput > 0 || inberOutput > 0 {
+		m.InputTokens = inberInput
+		m.OutputTokens = inberOutput
+		m.CacheReadTokens = inberCacheRead
+		m.CacheCreationTokens = inberCacheCreate
+		m.TotalTokens = inberInput + inberOutput
+		if inberTools > 0 {
+			m.ToolCalls = inberTools
 		}
 	}
 
 	// Try parsing openclaw JSON (--json output).
-	// The output may be pretty-printed, so find the first '{' and parse from there.
 	if idx := strings.Index(output, "{\n"); idx >= 0 && strings.Contains(output, `"payloads"`) {
 		jsonStr := output[idx:]
 		var ocResult struct {
-			Meta struct {
+			Payloads []json.RawMessage `json:"payloads"`
+			Meta     struct {
 				DurationMs int `json:"durationMs"`
 				AgentMeta  struct {
 					Model string `json:"model"`
 					Usage struct {
-						Input     int `json:"input"`
-						Output    int `json:"output"`
-						CacheRead int `json:"cacheRead"`
-						Total     int `json:"total"`
+						Input      int `json:"input"`
+						Output     int `json:"output"`
+						CacheRead  int `json:"cacheRead"`
+						CacheWrite int `json:"cacheWrite"`
+						Total      int `json:"total"`
 					} `json:"usage"`
 				} `json:"agentMeta"`
 			} `json:"meta"`
 		}
-		if err := json.Unmarshal([]byte(jsonStr), &ocResult); err == nil && (ocResult.Meta.AgentMeta.Usage.Input > 0 || ocResult.Meta.AgentMeta.Usage.Output > 0) {
+		if err := json.Unmarshal([]byte(jsonStr), &ocResult); err == nil {
 			u := ocResult.Meta.AgentMeta.Usage
-			m.InputTokens = u.Input
-			m.OutputTokens = u.Output
-			m.CacheReadTokens = u.CacheRead
-			// OpenClaw's "total" includes cache read; use input+output for fair comparison
-			m.TotalTokens = u.Input + u.Output
-			m.Model = ocResult.Meta.AgentMeta.Model
+			if u.Input > 0 || u.Output > 0 || u.CacheRead > 0 {
+				m.InputTokens = u.Input
+				m.OutputTokens = u.Output
+				m.CacheReadTokens = u.CacheRead
+				m.CacheCreationTokens = u.CacheWrite
+				m.TotalTokens = u.Input + u.Output
+				m.Model = ocResult.Meta.AgentMeta.Model
+			}
+			// Estimate turns from payloads count (each payload is a distinct agent response)
+			if len(ocResult.Payloads) > 0 {
+				m.Turns = len(ocResult.Payloads)
+			}
 		}
 	}
 
-	// Apply accumulated inber cache tokens
-	if inberCacheRead > 0 {
-		m.CacheReadTokens = inberCacheRead
-	}
-
-	// Set total if not parsed
+	// Set total if not computed
 	if m.TotalTokens == 0 && (m.InputTokens > 0 || m.OutputTokens > 0) {
 		m.TotalTokens = m.InputTokens + m.OutputTokens
 	}
