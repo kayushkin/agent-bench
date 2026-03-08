@@ -10,7 +10,7 @@ import (
 	"github.com/spf13/cobra"
 )
 
-var agents = []string{"inber", "claude-code", "openclaw"}
+var defaultAgents = []string{"inber", "openclaw"}
 
 func main() {
 	root := &cobra.Command{
@@ -18,16 +18,17 @@ func main() {
 		Short: "Benchmark AI coding agents on identical tasks",
 	}
 
-	// Run command
 	var (
 		agent    string
 		all      bool
 		task     string
 		repo     string
+		repoDir  string
 		commit   string
 		buildCmd string
 		testCmd  string
 		outDir   string
+		maxTurns int
 	)
 
 	runCmd := &cobra.Command{
@@ -37,31 +38,35 @@ func main() {
 			if task == "" {
 				return fmt.Errorf("--task is required")
 			}
-			if repo == "" {
-				return fmt.Errorf("--repo is required")
+			if repo == "" && repoDir == "" {
+				return fmt.Errorf("--repo or --dir is required")
 			}
 
+			timestamp := time.Now().Format("2006-01-02_150405")
 			if outDir == "" {
-				outDir = filepath.Join("results", time.Now().Format("2006-01-02"))
+				outDir = filepath.Join("results", timestamp)
 			}
-			workDir := filepath.Join("work", time.Now().Format("2006-01-02_150405"))
+			workDir := filepath.Join("work", timestamp)
+			os.MkdirAll(workDir, 0755)
 
 			agentsToRun := []string{agent}
 			if all {
-				agentsToRun = agents
+				agentsToRun = defaultAgents
 			}
 
 			for _, a := range agentsToRun {
-				fmt.Printf("\n═══ Running %s ═══\n\n", a)
+				fmt.Printf("\n═══ Running: %s ═══\n\n", a)
 
 				r := &bench.Runner{
 					WorkDir:  workDir,
 					Agent:    a,
 					Task:     task,
 					RepoURL:  repo,
+					RepoDir:  repoDir,
 					Commit:   commit,
 					BuildCmd: buildCmd,
 					TestCmd:  testCmd,
+					MaxTurns: maxTurns,
 				}
 
 				result, err := r.Run()
@@ -74,27 +79,37 @@ func main() {
 					fmt.Fprintf(os.Stderr, "error saving result: %v\n", err)
 				}
 
-				fmt.Printf("  tokens: in=%d out=%d total=%d\n", result.Metrics.InputTokens, result.Metrics.OutputTokens, result.Metrics.TotalTokens)
-				fmt.Printf("  cost: $%.4f\n", result.Metrics.CostUSD)
-				fmt.Printf("  time: %.1fs\n", result.Metrics.WallTimeSec)
-				fmt.Printf("  git: %d files, +%d -%d\n", result.Git.FilesChanged, result.Git.LinesAdded, result.Git.LinesRemoved)
-				fmt.Printf("  build: %v  tests: %v\n", result.Quality.Builds, result.Quality.TestsPass)
+				m := result.Metrics
+				q := result.Quality
+				fmt.Printf("  tokens: in=%d out=%d total=%d\n", m.InputTokens, m.OutputTokens, m.TotalTokens)
+				if m.CostUSD > 0 {
+					fmt.Printf("  cost:   $%.4f\n", m.CostUSD)
+				}
+				fmt.Printf("  turns:  %d  tools: %d\n", m.Turns, m.ToolCalls)
+				fmt.Printf("  time:   %.1fs\n", m.WallTimeSec)
+				fmt.Printf("  git:    %d files, +%d -%d\n", result.Git.FilesChanged, result.Git.LinesAdded, result.Git.LinesRemoved)
+				fmt.Printf("  build:  %v  tests: %v\n", q.Builds, q.TestsPass)
+				if result.Error != "" {
+					fmt.Printf("  error:  %s\n", result.Error)
+				}
+				fmt.Println()
 			}
 
 			return nil
 		},
 	}
 
-	runCmd.Flags().StringVarP(&agent, "agent", "a", "inber", "Agent to benchmark (inber, claude-code, openclaw)")
+	runCmd.Flags().StringVarP(&agent, "agent", "a", "inber", "Agent to benchmark (inber, openclaw)")
 	runCmd.Flags().BoolVar(&all, "all", false, "Run all agents")
 	runCmd.Flags().StringVarP(&task, "task", "t", "", "Path to task markdown file")
 	runCmd.Flags().StringVarP(&repo, "repo", "r", "", "Git repo URL to clone")
+	runCmd.Flags().StringVarP(&repoDir, "dir", "d", "", "Local repo directory to copy")
 	runCmd.Flags().StringVarP(&commit, "commit", "c", "", "Git commit to reset to")
 	runCmd.Flags().StringVar(&buildCmd, "build-cmd", "", "Build command (default: go build ./...)")
 	runCmd.Flags().StringVar(&testCmd, "test-cmd", "", "Test command (default: go test ./...)")
 	runCmd.Flags().StringVarP(&outDir, "out", "o", "", "Output directory for results")
+	runCmd.Flags().IntVar(&maxTurns, "max-turns", 15, "Max agent turns")
 
-	// Compare command
 	compareCmd := &cobra.Command{
 		Use:   "compare [results-dir]",
 		Short: "Compare benchmark results",

@@ -1,6 +1,8 @@
 package bench
 
 import (
+	"bufio"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -13,12 +15,14 @@ import (
 // Runner executes a single agent on a task against a repo.
 type Runner struct {
 	WorkDir  string // base directory for cloned repos
-	Agent    string // agent name: inber, openclaw, claude-code
+	Agent    string // agent name: inber, openclaw
 	Task     string // path to task markdown file
-	RepoURL  string // git clone URL
+	RepoDir  string // local repo directory (used directly, no cloning)
+	RepoURL  string // git clone URL (alternative to RepoDir)
 	Commit   string // git commit to reset to
 	BuildCmd string // build command (e.g. "go build ./...")
 	TestCmd  string // test command (e.g. "go test ./...")
+	MaxTurns int    // max agent turns (default 15)
 }
 
 // Run executes the benchmark and returns the result.
@@ -26,8 +30,6 @@ func (r *Runner) Run() (*Result, error) {
 	result := &Result{
 		Agent:     r.Agent,
 		Task:      filepath.Base(r.Task),
-		Repo:      r.RepoURL,
-		Commit:    r.Commit,
 		Timestamp: time.Now(),
 	}
 
@@ -37,10 +39,23 @@ func (r *Runner) Run() (*Result, error) {
 		return nil, fmt.Errorf("read task: %w", err)
 	}
 
-	// Prepare repo clone
-	repoDir := filepath.Join(r.WorkDir, r.Agent)
-	if err := r.prepareRepo(repoDir); err != nil {
-		return nil, fmt.Errorf("prepare repo: %w", err)
+	// Prepare repo: either use local dir or clone
+	repoDir := r.RepoDir
+	if repoDir == "" {
+		repoDir = filepath.Join(r.WorkDir, r.Agent)
+		result.Repo = r.RepoURL
+		result.Commit = r.Commit
+		if err := r.prepareRepo(repoDir); err != nil {
+			return nil, fmt.Errorf("prepare repo: %w", err)
+		}
+	} else {
+		// Copy the local repo to a working directory per agent
+		workCopy := filepath.Join(r.WorkDir, r.Agent)
+		if err := copyDir(repoDir, workCopy); err != nil {
+			return nil, fmt.Errorf("copy repo: %w", err)
+		}
+		repoDir = workCopy
+		result.Repo = repoDir
 	}
 
 	// Run the agent
@@ -68,7 +83,6 @@ func (r *Runner) Run() (*Result, error) {
 }
 
 func (r *Runner) prepareRepo(dir string) error {
-	// Clean and clone
 	os.RemoveAll(dir)
 	if err := run("git", "clone", r.RepoURL, dir); err != nil {
 		return fmt.Errorf("clone: %w", err)
@@ -85,8 +99,6 @@ func (r *Runner) runAgent(repoDir, prompt string) (string, error) {
 	switch r.Agent {
 	case "inber":
 		return r.runInber(repoDir, prompt)
-	case "claude-code":
-		return r.runClaudeCode(repoDir, prompt)
 	case "openclaw":
 		return r.runOpenClaw(repoDir, prompt)
 	default:
@@ -95,29 +107,93 @@ func (r *Runner) runAgent(repoDir, prompt string) (string, error) {
 }
 
 func (r *Runner) runInber(repoDir, prompt string) (string, error) {
-	cmd := exec.Command("inber", "run", "--new", "--detach", prompt)
-	cmd.Dir = repoDir
-	out, err := cmd.CombinedOutput()
-	return string(out), err
-}
+	maxTurns := r.MaxTurns
+	if maxTurns == 0 {
+		maxTurns = 15
+	}
 
-func (r *Runner) runClaudeCode(repoDir, prompt string) (string, error) {
-	cmd := exec.Command("claude", "-p", prompt, "--output-format", "json", "--max-turns", "20")
+	// inber run: synchronous, outputs to stdout/stderr
+	// --new: fresh session, --max-turns: limit turns
+	cmd := exec.Command("inber", "run",
+		"--new",
+		"--max-turns", strconv.Itoa(maxTurns),
+		prompt,
+	)
 	cmd.Dir = repoDir
+
+	// Capture both stdout and stderr
 	out, err := cmd.CombinedOutput()
 	return string(out), err
 }
 
 func (r *Runner) runOpenClaw(repoDir, prompt string) (string, error) {
-	// TODO: spawn via openclaw CLI or API
-	return "", fmt.Errorf("openclaw runner not yet implemented")
+	// Use openclaw agent --local with a dedicated bench agent
+	// to avoid session lock conflicts with running agents
+	sessionID := fmt.Sprintf("bench-%d", time.Now().UnixMilli())
+
+	// Resolve absolute path for the repo dir
+	absRepoDir, _ := filepath.Abs(repoDir)
+
+	// Prefix prompt with working directory context
+	fullPrompt := fmt.Sprintf("You are working in the directory: %s\n\nIMPORTANT: Use this exact path for all file operations. Do not read AGENTS.md, SOUL.md, USER.md, or any workspace files. Focus only on the task.\n\n%s", absRepoDir, prompt)
+
+	cmd := exec.Command("openclaw", "agent",
+		"--local",
+		"--json",
+		"--agent", "agent-bench",
+		"--session-id", sessionID,
+		"--message", fullPrompt,
+		"--timeout", "300",
+	)
+	cmd.Dir = absRepoDir
+
+	// Capture stdout and stderr separately — openclaw writes
+	// diagnostic lines to stderr and JSON result to stdout
+	var stdout, stderr strings.Builder
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+
+	combined := stdout.String() + "\n" + stderr.String()
+
+	// Save raw output for debugging
+	debugDir := filepath.Join(r.WorkDir, "debug")
+	os.MkdirAll(debugDir, 0755)
+	os.WriteFile(filepath.Join(debugDir, "openclaw-stdout.txt"), []byte(stdout.String()), 0644)
+	os.WriteFile(filepath.Join(debugDir, "openclaw-stderr.txt"), []byte(stderr.String()), 0644)
+
+	return combined, err
 }
 
 func (r *Runner) parseMetrics(output string, m *Metrics) {
-	// Parse inber-style output: "in=63593 out=789 total=64382 tools=9"
-	for _, line := range strings.Split(output, "\n") {
+	lines := strings.Split(output, "\n")
+
+	for _, line := range lines {
 		line = strings.TrimSpace(line)
 
+		// Parse INBER_META:{json} from stderr (inber)
+		if strings.HasPrefix(line, "INBER_META:") {
+			metaJSON := strings.TrimPrefix(line, "INBER_META:")
+			var meta struct {
+				InputTokens  int     `json:"input_tokens"`
+				OutputTokens int     `json:"output_tokens"`
+				TotalTokens  int     `json:"total_tokens"`
+				ToolCalls    int     `json:"tool_calls"`
+				Turns        int     `json:"turns"`
+				CostUSD      float64 `json:"cost_usd"`
+			}
+			if err := json.Unmarshal([]byte(metaJSON), &meta); err == nil {
+				m.InputTokens = meta.InputTokens
+				m.OutputTokens = meta.OutputTokens
+				m.TotalTokens = meta.TotalTokens
+				m.ToolCalls = meta.ToolCalls
+				m.Turns = meta.Turns
+				m.CostUSD = meta.CostUSD
+			}
+			continue
+		}
+
+		// Fallback: parse "in=X out=Y total=Z tools=N" format
 		if strings.Contains(line, "in=") && strings.Contains(line, "out=") {
 			for _, part := range strings.Fields(line) {
 				if strings.HasPrefix(part, "in=") {
@@ -135,27 +211,63 @@ func (r *Runner) parseMetrics(output string, m *Metrics) {
 			}
 		}
 
-		if strings.Contains(line, "cost=$") {
-			idx := strings.Index(line, "cost=$")
-			costStr := line[idx+6:]
-			if space := strings.IndexAny(costStr, " \t\n"); space > 0 {
-				costStr = costStr[:space]
-			}
-			m.CostUSD, _ = strconv.ParseFloat(costStr, 64)
-		}
-
 		// Count turns from "━━━ Turn N ━━━"
 		if strings.Contains(line, "Turn") && strings.Contains(line, "━━━") {
 			m.Turns++
 		}
+	}
+
+	// Try parsing openclaw JSON (--json output).
+	// The output may be pretty-printed, so find the first '{' and parse from there.
+	if idx := strings.Index(output, "{\n"); idx >= 0 && strings.Contains(output, `"payloads"`) {
+		jsonStr := output[idx:]
+		var ocResult struct {
+			Meta struct {
+				DurationMs int `json:"durationMs"`
+				AgentMeta  struct {
+					Model string `json:"model"`
+					Usage struct {
+						Input     int `json:"input"`
+						Output    int `json:"output"`
+						CacheRead int `json:"cacheRead"`
+						Total     int `json:"total"`
+					} `json:"usage"`
+				} `json:"agentMeta"`
+			} `json:"meta"`
+		}
+		if err := json.Unmarshal([]byte(jsonStr), &ocResult); err == nil && (ocResult.Meta.AgentMeta.Usage.Input > 0 || ocResult.Meta.AgentMeta.Usage.Output > 0) {
+			u := ocResult.Meta.AgentMeta.Usage
+			m.InputTokens = u.Input
+			m.OutputTokens = u.Output
+			m.CacheReadTokens = u.CacheRead
+			// OpenClaw's "total" includes cache read; use input+output for fair comparison
+			m.TotalTokens = u.Input + u.Output
+			m.Model = ocResult.Meta.AgentMeta.Model
+		}
+	}
+
+	// Set total if not parsed
+	if m.TotalTokens == 0 && (m.InputTokens > 0 || m.OutputTokens > 0) {
+		m.TotalTokens = m.InputTokens + m.OutputTokens
 	}
 }
 
 func (r *Runner) collectGitStats(repoDir string) GitStats {
 	stats := GitStats{}
 
-	// git diff --stat
-	out, err := output(repoDir, "git", "diff", "--stat", "HEAD")
+	// Find the original commit (first commit in repo) to diff against.
+	// This captures both committed and uncommitted changes the agent made.
+	baseCommit := "HEAD"
+	firstCommit, err := output(repoDir, "git", "rev-list", "--max-parents=0", "HEAD")
+	if err == nil {
+		fc := strings.TrimSpace(firstCommit)
+		if fc != "" {
+			baseCommit = fc
+		}
+	}
+
+	// Include both staged+unstaged changes: diff from base to working tree
+	out, err := output(repoDir, "git", "diff", "--stat", baseCommit)
 	if err != nil {
 		return stats
 	}
@@ -163,10 +275,6 @@ func (r *Runner) collectGitStats(repoDir string) GitStats {
 	lines := strings.Split(strings.TrimSpace(out), "\n")
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		// Last line is summary: "N files changed, N insertions(+), N deletions(-)"
 		if strings.Contains(line, "files changed") || strings.Contains(line, "file changed") {
 			parts := strings.Fields(line)
 			if len(parts) > 0 {
@@ -183,8 +291,7 @@ func (r *Runner) collectGitStats(repoDir string) GitStats {
 		}
 	}
 
-	// git diff --name-only
-	nameOut, _ := output(repoDir, "git", "diff", "--name-only", "HEAD")
+	nameOut, _ := output(repoDir, "git", "diff", "--name-only", baseCommit)
 	for _, f := range strings.Split(strings.TrimSpace(nameOut), "\n") {
 		f = strings.TrimSpace(f)
 		if f != "" {
@@ -207,10 +314,10 @@ func (r *Runner) checkQuality(repoDir string) QualityCheck {
 		testCmd = "go test ./..."
 	}
 
-	// Build
 	q.Builds = runIn(repoDir, "sh", "-c", buildCmd) == nil
 
-	// Test
+	// Clear test cache so we get a real run
+	runIn(repoDir, "go", "clean", "-testcache")
 	testOut, err := output(repoDir, "sh", "-c", testCmd)
 	q.TestsPass = err == nil
 	q.TestOutput = testOut
@@ -218,7 +325,33 @@ func (r *Runner) checkQuality(repoDir string) QualityCheck {
 	return q
 }
 
+// copyDir copies src directory to dst and initializes a fresh git repo.
+func copyDir(src, dst string) error {
+	os.RemoveAll(dst)
+	// Copy without preserving git metadata
+	if err := runCmd("cp", "-r", src, dst); err != nil {
+		return err
+	}
+	// Remove any inherited .git from parent
+	os.RemoveAll(filepath.Join(dst, ".git"))
+	// Initialize fresh repo
+	if err := runIn(dst, "git", "init"); err != nil {
+		return err
+	}
+	if err := runIn(dst, "git", "add", "-A"); err != nil {
+		return err
+	}
+	return runIn(dst, "git", "commit", "-m", "initial")
+}
+
 // helpers
+
+func runCmd(name string, args ...string) error {
+	cmd := exec.Command(name, args...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
 
 func run(name string, args ...string) error {
 	cmd := exec.Command(name, args...)
@@ -238,4 +371,13 @@ func output(dir, name string, args ...string) (string, error) {
 	cmd.Dir = dir
 	out, err := cmd.CombinedOutput()
 	return string(out), err
+}
+
+// outputLines runs a command and returns stdout lines via a scanner callback.
+func outputLines(dir, name string, args ...string) *bufio.Scanner {
+	cmd := exec.Command(name, args...)
+	cmd.Dir = dir
+	pipe, _ := cmd.StdoutPipe()
+	cmd.Start()
+	return bufio.NewScanner(pipe)
 }

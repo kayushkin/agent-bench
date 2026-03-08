@@ -66,9 +66,9 @@ func (r *Report) PrintComparison() {
 	task := r.Results[0].Task
 
 	fmt.Printf("\n═══ Agent Benchmark: %s ═══\n\n", task)
-	fmt.Printf("%-14s %10s %10s %10s %8s %6s %6s %6s %5s %5s\n",
-		"Agent", "In Tokens", "Out Tokens", "Total", "Cost", "Turns", "Tools", "Time", "Build", "Test")
-	fmt.Println(strings.Repeat("─", 95))
+	fmt.Printf("%-12s %8s %8s %8s %8s %6s %6s %6s %5s %5s\n",
+		"Agent", "Input", "Output", "Total", "Cache", "Turns", "Tools", "Time", "Build", "Test")
+	fmt.Println(strings.Repeat("─", 90))
 
 	for _, res := range r.Results {
 		m := res.Metrics
@@ -82,17 +82,28 @@ func (r *Report) PrintComparison() {
 			testStr = "✗"
 		}
 
-		fmt.Printf("%-14s %10d %10d %10d %7s %6d %6d %5.0fs %5s %5s\n",
+		cacheStr := "-"
+		if m.CacheReadTokens > 0 {
+			cacheStr = fmt.Sprintf("%d", m.CacheReadTokens)
+		}
+
+		modelStr := ""
+		if m.Model != "" {
+			modelStr = fmt.Sprintf(" (%s)", m.Model)
+		}
+
+		fmt.Printf("%-12s %8d %8d %8d %8s %6d %6d %5.0fs %5s %5s%s\n",
 			res.Agent,
 			m.InputTokens,
 			m.OutputTokens,
 			m.TotalTokens,
-			fmt.Sprintf("$%.2f", m.CostUSD),
+			cacheStr,
 			m.Turns,
 			m.ToolCalls,
 			m.WallTimeSec,
 			buildStr,
 			testStr,
+			modelStr,
 		)
 	}
 

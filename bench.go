@@ -17,14 +17,16 @@ type Result struct {
 
 // Metrics tracks token usage and timing.
 type Metrics struct {
-	InputTokens  int           `json:"input_tokens"`
-	OutputTokens int           `json:"output_tokens"`
-	TotalTokens  int           `json:"total_tokens"`
-	CostUSD      float64       `json:"cost_usd"`
-	Turns        int           `json:"turns"`
-	ToolCalls    int           `json:"tool_calls"`
-	WallTime     time.Duration `json:"wall_time_ns"`
-	WallTimeSec  float64       `json:"wall_time_sec"`
+	InputTokens    int           `json:"input_tokens"`
+	OutputTokens   int           `json:"output_tokens"`
+	TotalTokens    int           `json:"total_tokens"`
+	CacheReadTokens int          `json:"cache_read_tokens,omitempty"`
+	CostUSD        float64       `json:"cost_usd"`
+	Turns          int           `json:"turns"`
+	ToolCalls      int           `json:"tool_calls"`
+	Model          string        `json:"model,omitempty"`
+	WallTime       time.Duration `json:"wall_time_ns"`
+	WallTimeSec    float64       `json:"wall_time_sec"`
 }
 
 // GitStats captures the code diff.
