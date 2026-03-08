@@ -133,6 +133,12 @@ func (r *Runner) runInber(repoDir, prompt string) (string, error) {
 	cmd.Dir = repoDir
 
 	out, err := cmd.CombinedOutput()
+
+	// Save debug output
+	debugDir := filepath.Join(r.WorkDir, "debug")
+	os.MkdirAll(debugDir, 0755)
+	os.WriteFile(filepath.Join(debugDir, "inber-output.txt"), out, 0644)
+
 	return string(out), err
 }
 
@@ -191,6 +197,7 @@ func (r *Runner) pinOpenClawModel(model string) {
 
 func (r *Runner) parseMetrics(output string, m *Metrics) {
 	lines := strings.Split(output, "\n")
+	var inberCacheRead int
 
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
@@ -199,20 +206,20 @@ func (r *Runner) parseMetrics(output string, m *Metrics) {
 		if strings.HasPrefix(line, "INBER_META:") {
 			metaJSON := strings.TrimPrefix(line, "INBER_META:")
 			var meta struct {
-				InputTokens  int     `json:"input_tokens"`
-				OutputTokens int     `json:"output_tokens"`
-				TotalTokens  int     `json:"total_tokens"`
-				ToolCalls    int     `json:"tool_calls"`
-				Turns        int     `json:"turns"`
-				CostUSD      float64 `json:"cost_usd"`
+				InputTokens     int     `json:"input_tokens"`
+				OutputTokens    int     `json:"output_tokens"`
+				CacheReadTokens int     `json:"cache_read_tokens"`
+				Model           string  `json:"model"`
+				Cost            float64 `json:"cost"`
+				ToolCalls       int     `json:"tool_calls"`
+				Turn            int     `json:"turn"`
 			}
 			if err := json.Unmarshal([]byte(metaJSON), &meta); err == nil {
-				m.InputTokens = meta.InputTokens
-				m.OutputTokens = meta.OutputTokens
-				m.TotalTokens = meta.TotalTokens
-				m.ToolCalls = meta.ToolCalls
-				m.Turns = meta.Turns
-				m.CostUSD = meta.CostUSD
+				// INBER_META is emitted per turn — accumulate
+				inberCacheRead += meta.CacheReadTokens
+				if meta.Model != "" {
+					m.Model = meta.Model
+				}
 			}
 			continue
 		}
@@ -268,6 +275,11 @@ func (r *Runner) parseMetrics(output string, m *Metrics) {
 			m.TotalTokens = u.Input + u.Output
 			m.Model = ocResult.Meta.AgentMeta.Model
 		}
+	}
+
+	// Apply accumulated inber cache tokens
+	if inberCacheRead > 0 {
+		m.CacheReadTokens = inberCacheRead
 	}
 
 	// Set total if not parsed
